@@ -33,7 +33,7 @@ use sp_runtime::{
         AccountIdLookup, BlakeTwo256, Block as BlockT, IdentifyAccount, NumberFor, One, Verify,
     },
     transaction_validity::{TransactionSource, TransactionValidity},
-    ApplyExtrinsicResult, MultiSignature,
+    ApplyExtrinsicResult, DispatchResult, MultiSignature,
 };
 use sp_std::cmp::Ordering;
 use sp_std::prelude::*;
@@ -64,6 +64,8 @@ use pallet_transaction_payment::{CurrencyAdapter, Multiplier};
 #[cfg(any(feature = "std", test))]
 pub use sp_runtime::BuildStorage;
 pub use sp_runtime::{Perbill, Permill};
+
+use pallet_subtensor::types::TensorBytes;
 
 // Subtensor module
 pub use pallet_subtensor;
@@ -130,12 +132,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     spec_name: create_runtime_str!("node-subtensor"),
     impl_name: create_runtime_str!("node-subtensor"),
     authoring_version: 1,
-    // The version of the runtime specification. A full node will not attempt to use its native
-    //   runtime in substitute for the on-chain Wasm runtime unless all of `spec_name`,
-    //   `spec_version`, and `authoring_version` are the same between Wasm and native.
-    // This value is set to 100 to notify Polkadot-JS App (https://polkadot.js.org/apps) to use
-    //   the compatible custom types.
-    spec_version: 152,
+    spec_version: 1,
     impl_version: 1,
     apis: RUNTIME_API_VERSIONS,
     transaction_version: 1,
@@ -148,12 +145,18 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 /// up by `pallet_aura` to implement `fn slot_duration()`.
 ///
 /// Change this to adjust the block time.
+// #[cfg(not(feature = "fast-blocks"))]
+// pub const MILLISECS_PER_BLOCK: u64 = 12000;
+
 #[cfg(not(feature = "fast-blocks"))]
-pub const MILLISECS_PER_BLOCK: u64 = 12000;
+pub const SUBNET_CREATOR_LOCK: u64 = 7 * 7200 * 3; // 3 months
 
 /// Fast blocks for development
 #[cfg(feature = "fast-blocks")]
-pub const MILLISECS_PER_BLOCK: u64 = 250;
+pub const MILLISECS_PER_BLOCK: u64 = 1000;
+
+#[cfg(feature = "fast-blocks")]
+pub const SUBNET_CREATOR_LOCK: u64 = 240; // 1 minute
 
 // NOTE: Currently it is not possible to change the slot duration after the chain has started.
 //       Attempting to do so will brick block production.
@@ -299,7 +302,6 @@ impl pallet_balances::Config for Runtime {
     type ExistentialDeposit = ConstU64<EXISTENTIAL_DEPOSIT>;
     type AccountStore = System;
     type WeightInfo = pallet_balances::weights::SubstrateWeight<Runtime>;
-
     type RuntimeHoldReason = RuntimeHoldReason;
     type RuntimeFreezeReason = RuntimeFreezeReason;
     type FreezeIdentifier = RuntimeFreezeReason;
@@ -735,7 +737,6 @@ impl pallet_registry::Config for Runtime {
     type Currency = Balances;
     type CanRegister = AllowIdentityReg;
     type WeightInfo = pallet_registry::weights::SubstrateWeight<Runtime>;
-
     type MaxAdditionalFields = MaxAdditionalFields;
     type InitialDeposit = InitialDeposit;
     type FieldDeposit = FieldDeposit;
@@ -787,6 +788,8 @@ parameter_types! {
     pub const SubtensorInitialScalingLawPower: u16 = 50; // 0.5
     pub const SubtensorInitialMaxAllowedValidators: u16 = 128;
     pub const SubtensorInitialTempo: u16 = 99;
+    pub const SubtensorMinTempo: u16 = 360;
+    pub const SubtensorMaxTempo: u16 = 360;
     pub const SubtensorInitialDifficulty: u64 = 10_000_000;
     pub const SubtensorInitialAdjustmentInterval: u16 = 100;
     pub const SubtensorInitialAdjustmentAlpha: u64 = 0; // no weight to previous value.
@@ -817,6 +820,7 @@ parameter_types! {
     pub const SubtensorInitialNetworkLockReductionInterval: u64 = 14 * 7200;
     pub const SubtensorInitialNetworkRateLimit: u64 = 7200;
     pub const SubtensorInitialTargetStakesPerInterval: u16 = 1;
+    pub const SubtensorInitialSubnetOwnerLockPeriod: u64 = SUBNET_CREATOR_LOCK;
 }
 
 impl pallet_subtensor::Config for Runtime {
@@ -838,6 +842,8 @@ impl pallet_subtensor::Config for Runtime {
     type InitialValidatorPruneLen = SubtensorInitialValidatorPruneLen;
     type InitialScalingLawPower = SubtensorInitialScalingLawPower;
     type InitialTempo = SubtensorInitialTempo;
+    type MinTempo = SubtensorMinTempo;
+    type MaxTempo = SubtensorMaxTempo;
     type InitialDifficulty = SubtensorInitialDifficulty;
     type InitialAdjustmentInterval = SubtensorInitialAdjustmentInterval;
     type InitialAdjustmentAlpha = SubtensorInitialAdjustmentAlpha;
@@ -868,6 +874,7 @@ impl pallet_subtensor::Config for Runtime {
     type InitialSubnetLimit = SubtensorInitialSubnetLimit;
     type InitialNetworkRateLimit = SubtensorInitialNetworkRateLimit;
     type InitialTargetStakesPerInterval = SubtensorInitialTargetStakesPerInterval;
+    type InitialSubnetOwnerLockPeriod = SubtensorInitialSubnetOwnerLockPeriod;
 }
 
 use sp_runtime::BoundedVec;
@@ -964,12 +971,18 @@ impl
         SubtensorModule::coldkey_owns_hotkey(coldkey, hotkey)
     }
 
-    fn increase_stake_on_coldkey_hotkey_account(
+    fn increase_subnet_token_on_coldkey_hotkey_account(
         coldkey: &AccountId,
         hotkey: &AccountId,
-        increment: u64,
+        netuid: u16,
+        increment_alpha: u64,
     ) {
-        SubtensorModule::increase_stake_on_coldkey_hotkey_account(coldkey, hotkey, increment);
+        SubtensorModule::increase_subnet_token_on_coldkey_hotkey_account(
+            coldkey,
+            hotkey,
+            netuid,
+            increment_alpha,
+        );
     }
 
     fn add_balance_to_coldkey_account(coldkey: &AccountId, amount: Balance) {
@@ -1131,6 +1144,14 @@ impl
         SubtensorModule::get_nominator_min_required_stake()
     }
 
+    fn set_global_stake_weight(global_stake_weight: u16) {
+        SubtensorModule::set_global_stake_weight(global_stake_weight);
+    }
+
+    fn set_subnet_staking(subnet_staking: bool) {
+        SubtensorModule::set_subnet_staking(subnet_staking);
+    }
+
     fn set_target_stakes_per_interval(target_stakes_per_interval: u64) {
         SubtensorModule::set_target_stakes_per_interval(target_stakes_per_interval)
     }
@@ -1141,6 +1162,22 @@ impl
 
     fn set_commit_reveal_weights_enabled(netuid: u16, enabled: bool) {
         SubtensorModule::set_commit_reveal_weights_enabled(netuid, enabled);
+    }
+
+    fn do_start_stao_dtao_transition(netuid: u16) -> DispatchResult {
+        SubtensorModule::do_start_stao_dtao_transition(netuid)
+    }
+
+    fn do_start_stao_dtao_transition_for_all() -> DispatchResult {
+        SubtensorModule::do_start_stao_dtao_transition_for_all()
+    }
+
+    fn do_continue_stao_dtao_transition() -> Weight {
+        SubtensorModule::do_continue_stao_dtao_transition()
+    }
+
+    fn get_pending_emission(netuid: u16) -> u64 {
+        SubtensorModule::get_pending_emission(netuid)
     }
 }
 
@@ -1442,10 +1479,10 @@ impl_runtime_apis! {
             use frame_system_benchmarking::Pallet as SystemBench;
             use baseline::Pallet as BaselineBench;
 
-            #[allow(non_local_definitions)]
+            #[allow(dead_code)]
             impl frame_system_benchmarking::Config for Runtime {}
 
-            #[allow(non_local_definitions)]
+            #[allow(dead_code)]
             impl baseline::Config for Runtime {}
 
             use frame_support::traits::WhitelistedStorageKeys;
@@ -1482,6 +1519,26 @@ impl_runtime_apis! {
     }
 
     impl subtensor_custom_rpc_runtime_api::DelegateInfoRuntimeApi<Block> for Runtime {
+
+        fn get_substake_for_coldkey( coldkey_bytes: Vec<u8> ) -> Vec<u8> {
+            let result = SubtensorModule::get_substake_for_coldkey( coldkey_bytes );
+            result.encode()
+        }
+        fn get_substake_for_hotkey( hotkey_bytes: Vec<u8> ) -> Vec<u8> {
+            let result = SubtensorModule::get_substake_for_hotkey( hotkey_bytes );
+            result.encode()
+        }
+        fn get_substake_for_netuid( netuid: u16 ) -> Vec<u8> {
+            let result = SubtensorModule::get_substake_for_netuid( netuid );
+            result.encode()
+        }
+        fn get_total_stake_for_coldkey( coldkey_bytes: Vec<u8> ) -> u64 {
+            SubtensorModule::get_total_stake_for_coldkey( coldkey_bytes )
+        }
+        fn get_total_stake_for_hotkey( hotkey_bytes: Vec<u8> ) -> u64 {
+            SubtensorModule::get_total_stake_for_hotkey( hotkey_bytes )
+        }
+
         fn get_delegates() -> Vec<u8> {
             let result = SubtensorModule::get_delegates();
             result.encode()
@@ -1560,16 +1617,61 @@ impl_runtime_apis! {
                 vec![]
             }
         }
+        
+        fn get_subnet_info_v2(netuid: u16) -> Vec<u8> {
+            let _result = SubtensorModule::get_subnet_info_v2(netuid);
+            if _result.is_some() {
+                let result = _result.expect("Could not get SubnetInfo");
+                result.encode()
+            } else {
+                vec![]
+            }
+        }
+
+        fn get_subnets_info_v2() -> Vec<u8> {
+            let result = SubtensorModule::get_subnets_info_v2();
+            result.encode()
+        }
     }
 
     impl subtensor_custom_rpc_runtime_api::StakeInfoRuntimeApi<Block> for Runtime {
-        fn get_stake_info_for_coldkey( coldkey_account_vec: Vec<u8> ) -> Vec<u8> {
+        fn get_stake_info_for_coldkey( coldkey_account_vec: TensorBytes ) -> Vec<u8> {
             let result = SubtensorModule::get_stake_info_for_coldkey( coldkey_account_vec );
             result.encode()
         }
 
-        fn get_stake_info_for_coldkeys( coldkey_account_vecs: Vec<Vec<u8>> ) -> Vec<u8> {
+        fn get_stake_info_for_coldkeys( coldkey_account_vecs: Vec<TensorBytes> ) -> Vec<u8> {
             let result = SubtensorModule::get_stake_info_for_coldkeys( coldkey_account_vecs );
+            result.encode()
+        }
+
+        fn get_subnet_stake_info_for_coldkeys( coldkey_account_vecs: Vec<TensorBytes> ,netuid: u16 ) -> Vec<u8> {
+            let result = SubtensorModule::get_subnet_stake_info_for_coldkeys( coldkey_account_vecs, netuid );
+            result.encode()
+        }
+
+        fn get_all_stake_info_for_coldkey( coldkey_account_vec: TensorBytes ) -> Vec<u8> {
+            let result = SubtensorModule::get_all_stake_info_for_coldkey( coldkey_account_vec );
+            result.encode()
+        }
+
+        fn get_subnet_stake_info_for_coldkey( coldkey_account_vec: TensorBytes, netuid: u16 ) -> Vec<u8> {
+            let result = SubtensorModule::get_subnet_stake_info_for_coldkey( coldkey_account_vec, netuid );
+            result.encode()
+        }
+
+        fn get_total_subnet_stake( netuid: u16 ) -> Vec<u8> {
+            let result = SubtensorModule::get_total_subnet_stake( netuid );
+            result.encode()
+        }
+
+        fn get_all_subnet_stake_info_for_coldkey( coldkey_account_vec: TensorBytes ) -> Vec<u8> {
+            let result = SubtensorModule::get_all_subnet_stake_info_for_coldkey( coldkey_account_vec );
+            result.encode()
+        }
+
+        fn get_total_stake_for_each_subnet() -> Vec<u8> {
+            let result = SubtensorModule::get_total_stake_for_each_subnet();
             result.encode()
         }
     }
@@ -1579,10 +1681,26 @@ impl_runtime_apis! {
             SubtensorModule::get_network_lock_cost()
         }
     }
-}
 
-// #[cfg(test)]
-// mod tests {
+    impl subtensor_custom_rpc_runtime_api::DynamicPoolInfoRuntimeApi<Block> for Runtime {
+        fn get_dynamic_pool_info(netuid: u16) -> Vec<u8> {
+            let result = SubtensorModule::get_dynamic_pool_info(netuid);
+            result.encode()
+        }
+        fn get_all_dynamic_pool_infos() -> Vec<u8> {
+            let result = SubtensorModule::get_all_dynamic_pool_infos();
+            result.encode()
+        }        
+        fn get_dynamic_pool_info_v2(netuid: u16) -> Vec<u8> {
+            let result = SubtensorModule::get_dynamic_pool_info_v2(netuid);
+            result.encode()
+        }
+        fn get_all_dynamic_pool_infos_v2() -> Vec<u8> {
+            let result = SubtensorModule::get_all_dynamic_pool_infos_v2();
+            result.encode()
+        }
+    }
+}
 
 #[test]
 fn check_whitelist() {
@@ -1606,4 +1724,3 @@ fn check_whitelist() {
     // System Events
     assert!(whitelist.contains("26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7"));
 }
-// }

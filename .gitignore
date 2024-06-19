@@ -39,5 +39,10 @@ specs/*.json
 # IntelliJ IDEA configuration
 .idea
 
-# Runtime upgrade snapshot
-bt.snap
+# Baedeker output directory 
+.baedeker/.bdk-env
+
+alice.log
+bob.log
+charlie.log
+scripts/specs

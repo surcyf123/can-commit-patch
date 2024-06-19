@@ -1,9 +1,10 @@
 use super::*;
-use frame_support::storage::IterableStorageDoubleMap;
+use frame_support::{storage::IterableStorageDoubleMap};
 use sp_core::{Get, H256, U256};
 use sp_io::hashing::{keccak_256, sha2_256};
+use sp_std::vec;
+use sp_std::vec::Vec;
 use system::pallet_prelude::BlockNumberFor;
-
 const LOG_TARGET: &str = "runtime::subtensor::registration";
 
 impl<T: Config> Pallet<T> {
@@ -92,15 +93,16 @@ impl<T: Config> Pallet<T> {
 
         // --- 7. Ensure the callers coldkey has enough stake to perform the transaction.
         let current_block_number: u64 = Self::get_current_block_as_u64();
-        let registration_cost = Self::get_burn_as_u64(netuid);
+        let registration_cost_as_u64 = Self::get_burn_as_u64(netuid);
+        let registration_cost_as_balance = registration_cost_as_u64;
         ensure!(
-            Self::can_remove_balance_from_coldkey_account(&coldkey, registration_cost),
+            Self::can_remove_balance_from_coldkey_account(&coldkey, registration_cost_as_balance),
             Error::<T>::NotEnoughBalanceToStake
         );
 
         // --- 8. Ensure the remove operation from the coldkey is a success.
         let actual_burn_amount =
-            Self::remove_balance_from_coldkey_account(&coldkey, registration_cost)?;
+            Self::remove_balance_from_coldkey_account(&coldkey, registration_cost_as_balance)?;
 
         // The burn occurs here.
         Self::burn_tokens(actual_burn_amount);
@@ -394,8 +396,8 @@ impl<T: Config> Pallet<T> {
         UsedWork::<T>::insert(work.clone(), current_block_number);
 
         // --- 5. Add Balance via faucet.
-        let balance_to_add: u64 = 100_000_000_000;
-        Self::coinbase(100_000_000_000); // We are creating tokens here from the coinbase.
+        let balance_to_add: u64 = 3_000_000_000_000;
+        Self::coinbase(balance_to_add); // We are creating tokens here from the coinbase.
 
         Self::add_balance_to_coldkey_account(&coldkey, balance_to_add);
 
@@ -622,23 +624,18 @@ impl<T: Config> Pallet<T> {
             .saturating_accrue(T::DbWeight::get().reads((TotalNetworks::<T>::get() + 1u16) as u64));
 
         let swap_cost = 1_000_000_000u64;
+        let swap_cost_as_balance = swap_cost;
         ensure!(
             Self::can_remove_balance_from_coldkey_account(&coldkey, swap_cost),
             Error::<T>::NotEnoughBalanceToPaySwapHotKey
         );
-        let actual_burn_amount = Self::remove_balance_from_coldkey_account(&coldkey, swap_cost)?;
+        let actual_burn_amount =
+            Self::remove_balance_from_coldkey_account(&coldkey, swap_cost_as_balance)?;
         Self::burn_tokens(actual_burn_amount);
 
         Owner::<T>::remove(old_hotkey);
         Owner::<T>::insert(new_hotkey, coldkey.clone());
         weight.saturating_accrue(T::DbWeight::get().writes(2));
-
-        if let Ok(total_hotkey_stake) = TotalHotkeyStake::<T>::try_get(old_hotkey) {
-            TotalHotkeyStake::<T>::remove(old_hotkey);
-            TotalHotkeyStake::<T>::insert(new_hotkey, total_hotkey_stake);
-
-            weight.saturating_accrue(T::DbWeight::get().writes(2));
-        }
 
         if let Ok(delegate_take) = Delegates::<T>::try_get(old_hotkey) {
             Delegates::<T>::remove(old_hotkey);
@@ -647,6 +644,14 @@ impl<T: Config> Pallet<T> {
             weight.saturating_accrue(T::DbWeight::get().writes(2));
         }
 
+        for (netuid, delegate_take) in DelegatesTake::<T>::iter_prefix(old_hotkey) {
+            DelegatesTake::<T>::insert(new_hotkey, netuid, delegate_take);
+            weight.saturating_accrue(T::DbWeight::get().reads_writes(1, 1));
+        }
+        let subnet_limit = SubnetLimit::<T>::get().into();
+        let _ = DelegatesTake::<T>::clear_prefix(old_hotkey, subnet_limit, None);
+        weight.saturating_accrue(T::DbWeight::get().writes(subnet_limit.into()));
+
         if let Ok(last_tx) = LastTxBlock::<T>::try_get(old_hotkey) {
             LastTxBlock::<T>::remove(old_hotkey);
             LastTxBlock::<T>::insert(new_hotkey, last_tx);
@@ -654,16 +659,16 @@ impl<T: Config> Pallet<T> {
             weight.saturating_accrue(T::DbWeight::get().writes(2));
         }
 
-        let mut coldkey_stake: Vec<(T::AccountId, u64)> = vec![];
-        for (coldkey, stake_amount) in Stake::<T>::iter_prefix(old_hotkey) {
-            coldkey_stake.push((coldkey.clone(), stake_amount));
+        let mut coldkey_stake: Vec<(T::AccountId, bool)> = vec![];
+        for (coldkey, is_staker) in Staker::<T>::iter_prefix(old_hotkey) {
+            coldkey_stake.push((coldkey.clone(), is_staker));
         }
 
-        let _ = Stake::<T>::clear_prefix(old_hotkey, coldkey_stake.len() as u32, None);
+        let _ = Staker::<T>::clear_prefix(old_hotkey, coldkey_stake.len() as u32, None);
         weight.saturating_accrue(T::DbWeight::get().writes(coldkey_stake.len() as u64));
 
         for (coldkey, stake_amount) in coldkey_stake {
-            Stake::<T>::insert(new_hotkey, coldkey, stake_amount);
+            Staker::<T>::insert(new_hotkey, coldkey, stake_amount);
             weight.saturating_accrue(T::DbWeight::get().writes(1));
         }
 
