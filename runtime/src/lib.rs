@@ -1560,6 +1560,12 @@ impl_runtime_apis! {
                 vec![]
             }
         }
+        fn epoch(netuid: u16, rao_emission: u64) -> Vec<(Vec<u8>, u64, u64)> {
+            SubtensorModule::epoch(netuid, rao_emission)
+                .into_iter()
+                .map(|(account, value1, value2)| (account.encode(), value1, value2))
+                .collect()
+        }
     }
 
     impl subtensor_custom_rpc_runtime_api::StakeInfoRuntimeApi<Block> for Runtime {

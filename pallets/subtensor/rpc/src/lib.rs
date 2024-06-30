@@ -48,6 +48,8 @@ pub trait SubtensorCustomApi<BlockHash> {
     fn get_subnets_info(&self, at: Option<BlockHash>) -> RpcResult<Vec<u8>>;
     #[method(name = "subnetInfo_getSubnetHyperparams")]
     fn get_subnet_hyperparams(&self, netuid: u16, at: Option<BlockHash>) -> RpcResult<Vec<u8>>;
+    #[method(name = "subtensor_epoch")]
+    fn epoch(&self, netuid: u16, rao_emission: u64, at: Option<BlockHash>) -> RpcResult<Vec<(Vec<u8>, u64, u64)>>;
 
     #[method(name = "subnetInfo_getLockCost")]
     fn get_network_lock_cost(&self, at: Option<BlockHash>) -> RpcResult<u64>;
@@ -222,5 +224,13 @@ where
         api.get_network_registration_cost(at).map_err(|e| {
             Error::RuntimeError(format!("Unable to get subnet lock cost: {:?}", e)).into()
         })
+    }
+    
+    fn epoch(&self, netuid: u16, rao_emission: u64, at: Option<<Block as BlockT>::Hash>) -> RpcResult<Vec<(Vec<u8>, u64, u64)>> {
+        let api = self.client.runtime_api();
+        let at = at.unwrap_or_else(|| self.client.info().best_hash);
+
+        api.epoch(at, netuid, rao_emission)
+            .map_err(|e| Error::RuntimeError(format!("Unable to get epoch info: {:?}", e)).into())
     }
 }
